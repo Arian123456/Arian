@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useContext, useCallback } from 'react';
 import { User, Session } from '@supabase/supabase-js';
 import { supabase } from '@/integrations/supabase/client';
 import { useToast } from '@/hooks/use-toast';
@@ -11,40 +11,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [loading, setLoading] = useState(true);
   const { toast } = useToast();
 
-  useEffect(() => {
-    // Set up auth state listener first
-    const { data: { subscription } } = supabase.auth.onAuthStateChange(
-      async (event, session) => {
-        setSession(session);
-        setUser(session?.user ?? null);
-        
-        if (session?.user) {
-          // Defer profile fetching to avoid blocking
-          setTimeout(() => {
-            fetchProfile(session.user.id);
-          }, 0);
-        } else {
-          setProfile(null);
-        }
-        
-        setLoading(false);
-      }
-    );
-
-    // Then check for existing session
-    supabase.auth.getSession().then(({ data: { session } }) => {
-      setSession(session);
-      setUser(session?.user ?? null);
-      if (session?.user) {
-        fetchProfile(session.user.id);
-      }
-      setLoading(false);
-    });
-
-    return () => subscription.unsubscribe();
-  }, []);
-
-  const fetchProfile = async (userId: string) => {
+  const fetchProfile = useCallback(async (userId: string) => {
     try {
       const { data, error } = await supabase
         .from('profiles')
@@ -52,163 +19,160 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         .eq('user_id', userId)
         .single();
 
-      if (error) {
-        console.error('Error fetching profile:', error);
-        return;
-      }
-
+      if (error) throw error;
       setProfile(data);
     } catch (error) {
-      console.error('Error fetching profile:', error);
+      console.error('Profile fetch error:', error);
+      setProfile(null);
     }
-  };
+  }, []);
 
-  const signUp = async (email: string, password: string, role: UserRole, fullName: string, phone?: string) => {
+  useEffect(() => {
+    const { data: { subscription } } = supabase.auth.onAuthStateChange(
+      async (event, session) => {
+        setSession(session);
+        setUser(session?.user ?? null);
+        session?.user ? fetchProfile(session.user.id) : setProfile(null);
+        setLoading(false);
+      }
+    );
+
+    const initializeAuth = async () => {
+      const { data: { session } } = await supabase.auth.getSession();
+      setSession(session);
+      setUser(session?.user ?? null);
+      session?.user && fetchProfile(session.user.id);
+      setLoading(false);
+    };
+
+    initializeAuth();
+    return () => subscription.unsubscribe();
+  }, [fetchProfile]);
+
+  const signUp = async (
+    email: string, 
+    password: string, 
+    role: UserRole, 
+    fullName: string, 
+    phone?: string
+  ) => {
     try {
-      const redirectUrl = `${window.location.origin}/`;
+      setLoading(true);
+      const redirectUrl = `${window.location.origin}/auth/callback`;
       
       const { data, error } = await supabase.auth.signUp({
         email,
         password,
         options: {
           emailRedirectTo: redirectUrl,
-          data: {
-            role,
-            full_name: fullName,
-            phone_number: phone || null,
-          }
+          data: { role, full_name: fullName, phone_number: phone }
         }
       });
 
       if (error) throw error;
 
-      // If sign up is successful but no profile was created by trigger, create it manually
-      if (data.user && !error) {
-        // Wait a moment for the trigger to potentially create the profile
+      if (data.user) {
         setTimeout(async () => {
-          try {
-            const { data: existingProfile } = await supabase
-              .from('profiles')
-              .select('*')
-              .eq('user_id', data.user!.id)
-              .single();
+          const { error: profileError } = await supabase
+            .from('profiles')
+            .upsert({
+              user_id: data.user!.id,
+              full_name: fullName,
+              role,
+              phone_number: phone
+            });
 
-            if (!existingProfile) {
-              // Create profile manually if trigger failed
-              await supabase
-                .from('profiles')
-                .insert({
-                  user_id: data.user!.id,
-                  full_name: fullName,
-                  role,
-                  phone_number: phone || null,
-                });
-            }
-          } catch (profileError) {
-            console.error('Error creating profile manually:', profileError);
-          }
+          if (profileError) console.error('Profile creation error:', profileError);
         }, 1000);
       }
 
+      toast({ title: "Verify Your Email", description: "Check your inbox for the confirmation link." });
+      await trackEvent('signup', { role });
+      
+    } catch (error) {
       toast({
-        title: "Account Created",
-        description: "Please check your email to verify your account.",
-      });
-
-      // Track sign up event
-      await trackEvent('user_signup', { role, email });
-
-    } catch (error: unknown) {
-      console.error('Sign up error:', error);
-      const errorMessage = error instanceof Error ? error.message : 'An unknown error occurred';
-      toast({
-        title: "Sign Up Error",
-        description: errorMessage,
-        variant: "destructive",
+        title: "Signup Failed",
+        description: error instanceof Error ? error.message : 'An unknown error occurred',
+        variant: "destructive"
       });
       throw error;
+    } finally {
+      setLoading(false);
     }
   };
 
   const signIn = async (email: string, password: string) => {
     try {
-      const { error } = await supabase.auth.signInWithPassword({
-        email,
-        password,
-      });
-
+      setLoading(true);
+      const { error } = await supabase.auth.signInWithPassword({ email, password });
       if (error) throw error;
-
+      
+      toast({ title: "Welcome Back!", description: "You're now signed in." });
+      await trackEvent('login', { email });
+      
+    } catch (error) {
       toast({
-        title: "Welcome back!",
-        description: "You have successfully signed in.",
-      });
-
-      // Track sign in event
-      await trackEvent('user_signin', { email });
-
-    } catch (error: unknown) {
-      const errorMessage = error instanceof Error ? error.message : 'An unknown error occurred';
-      toast({
-        title: "Sign In Error",
-        description: errorMessage,
-        variant: "destructive",
+        title: "Login Failed",
+        description: error instanceof Error ? error.message : 'Invalid credentials',
+        variant: "destructive"
       });
       throw error;
+    } finally {
+      setLoading(false);
     }
   };
 
   const signOut = async () => {
     try {
-      // Track sign out event before signing out
-      if (user) {
-        await trackEvent('user_signout', { user_id: user.id });
-      }
-
+      setLoading(true);
+      if (user) await trackEvent('logout', { user_id: user.id });
+      
       const { error } = await supabase.auth.signOut();
       if (error) throw error;
-
+      
+      toast({ title: "Signed Out", description: "You've been logged out successfully." });
+      
+    } catch (error) {
       toast({
-        title: "Signed Out",
-        description: "You have been successfully signed out.",
+        title: "Logout Error",
+        description: error instanceof Error ? error.message : 'Failed to sign out',
+        variant: "destructive"
       });
-
-    } catch (error: unknown) {
-      const errorMessage = error instanceof Error ? error.message : 'An unknown error occurred';
-      toast({
-        title: "Sign Out Error",
-        description: errorMessage,
-        variant: "destructive",
-      });
+    } finally {
+      setLoading(false);
     }
   };
 
-  const trackEvent = async (eventType: string, eventData: Record<string, unknown> = {}) => {
+  const trackEvent = async (eventType: string, payload: Record<string, unknown> = {}) => {
     try {
       await supabase.functions.invoke('track-user', {
-        body: {
-          eventType,
-          eventData,
-          userId: user?.id || profile?.user_id,
-        }
+        body: { eventType, userId: user?.id, ...payload }
       });
     } catch (error) {
-      console.error('Error tracking event:', error);
+      console.error('Tracking error:', error);
     }
+  };
+
+  const value = {
+    user,
+    session,
+    profile,
+    loading,
+    signUp,
+    signIn,
+    signOut,
+    trackEvent
   };
 
   return (
-    <AuthContext.Provider value={{
-      user,
-      session,
-      profile,
-      loading,
-      signUp,
-      signIn,
-      signOut,
-      trackEvent,
-    }}>
+    <AuthContext.Provider value={value}>
       {children}
     </AuthContext.Provider>
   );
 }
+
+export const useAuth = () => {
+  const context = useContext(AuthContext);
+  if (!context) throw new Error('useAuth must be used within AuthProvider');
+  return context;
+};
